@@ -1,0 +1,294 @@
+---
+title: "RIP-seq"
+author: "john"
+date: "2024-04-09"
+output: html_document
+---
+
+# RIP-seq数据分析
+
+## 分析文件构建
+```{bash}
+mkdir 0.raw_fq
+mkdir 1.clean_fq
+mkdir 2.rmdup_fq
+mkdir 3.mapped
+mkdir 4.bamtobed
+mkdir 5.callpeak
+
+mkdir 7.downstream
+
+```
+
+
+## 数据质控
+### 基础质控
+```{bash}
+# 批量重命名
+perl -MCPAN -e 'install File::Rename'
+rename -v "s/\.raw//g" rip{1..8}.*.fastq.gz
+
+# 查看reads数
+ls ./0.raw_fq/*.fastq.gz | grep 'R1' | while read id
+do
+  file=$(basename ${id})
+  prefix=${file%%.*}
+  echo $file
+  echo $prefix
+  
+  zcat $id | paste - - - - | wc -l
+done
+
+# 使用fastp进行质控
+#fastp --version
+#fastp 0.22.0
+ls ./0.raw_fq/*.fastq.gz |grep 'R1' | while read id
+do
+  file=$(basename ${id})
+  prefix=${file%%.*}
+  
+  fastp -i ./0.raw_fq/${prefix}.R1.fastq.gz \
+  -I ./0.raw_fq/${prefix}.R2.fastq.gz \
+  -w 16 \
+  -g --trim_poly_g \
+  -x --trim_poly_x --poly_x_min_len 8 \
+  -o ./1.clean_fq/${prefix}_R1.fq \
+  -O ./1.clean_fq/${prefix}_R2.fq \
+  -h ./QC/${prefix}.html
+done
+  #--dedup --dup_calc_accuracy 6 \
+
+```
+
+## 比对到参考基因组
+```{bash}
+grcz11_genome_star="/home/huangqllab/ref/zebrafish/grcz11/genome/grcz11_genome_star"
+grcz11_genome_chrlen="/home/huangqllab/ref/zebrafish/grcz11/genome/grcz11_genome_star/chrNameLength.txt"
+grcz11_genome="/home/huangqllab/ref/zebrafish/grcz11/genome/GRCz11.fasta"
+grcz11_gtf="/home/huangqllab/ref/zebrafish/grcz11/genome/GRCz11.gtf"
+
+#STAR --version
+#2.7.11a
+ls ./1.clean_fq/*.fastq.gz | grep 'R1' | while read id
+do
+  file=$(basename ${id})
+  prefix=${file%%_*}
+  file2=$(echo "${id}" | sed 's/_R1/_R2/g')
+  
+  echo "===== processing ${prefix} ====="
+
+  STAR --runThreadN 26 \
+  --runMode alignReads \
+  --genomeDir ${grcz11_genome_star} \
+  --outFilterMismatchNoverReadLmax 0.04 \
+  --outFilterMismatchNmax 5 \
+  --outFilterMultimapNmax 1 \
+  --alignEndsType Extend5pOfRead1 \
+  --sjdbGTFfile ${grcz11_gtf} \
+  --sjdbOverhang 149 \
+  --outReadsUnmapped Fastx \
+  --outSJfilterReads Unique \
+  --readFilesCommand zcat \
+  --outSAMtype BAM Unsorted \
+  --readFilesIn ${id} ${file2} \
+  --outStd BAM_Unsorted | \
+  samtools sort -O bam \
+  -o ./3.mapped/${prefix}.bam -@ 26
+  
+  samtools index ./3.mapped/${prefix}.bam
+  
+  echo "===== processing ${prefix} done ====="
+done
+
+ls *.bam | while read id
+do
+  file=$(basename ${id})
+  prefix=${file%%.*}
+  echo $prefix
+
+  bamCoverage --bam ${id} \
+    -o ./${prefix}.bw \
+    --binSize 10 \
+    --normalizeUsing RPGC \
+    --effectiveGenomeSize 1368780147
+    
+done
+
+# dm6 142573017
+
+ls *.bam | while read id
+do
+  file=$(basename ${id})
+  prefix=${file%%.*}
+  echo $prefix
+
+  bamCoverage --bam ${id} \
+    -o ./${prefix}.bw \
+    --binSize 10 \
+    --normalizeUsing RPGC \
+    --effectiveGenomeSize 142573017
+    
+done
+```
+
+## peak calling
+### macs3
+```{bash}
+# 自建库wt call peak
+macs2 callpeak \
+-c rip1.bam \
+-t rip3.bam \
+--nomodel \
+-f BAMPE \
+-q 0.05 \
+-g 1368780147 \
+-n z_wt \
+--outdir ../5.callpeak/
+
+# 自建库ki call peak
+macs2 callpeak \
+-c rip2.bam \
+-t rip4.bam \
+--nomodel \
+-f BAMPE \
+-q 0.05 \
+-g 1368780147 \
+-n z_ki \
+--outdir ../5.callpeak/
+
+# 试剂盒ki call peak
+macs2 callpeak \
+-c rip6.bam \
+-t rip8.bam \
+--nomodel \
+-f BAMPE \
+-q 0.05 \
+-g 1368780147 \
+-n s_ki \
+--outdir ../5.callpeak/
+
+# ki IP vs wt IP
+/home/huangqllab/miniconda3/envs/dnaPy3.8/bin/macs2 callpeak \
+-c rip3.bam \
+-t rip4.bam \
+--nomodel \
+-f BAMPE \
+-q 0.05 \
+-g 1368780147 \
+-n vs_ip_ki_wt \
+--outdir ../5.callpeak/
+
+#--shift 0 \
+#--extsize 0 \
+#--broad \
+
+# lsx_dm6
+macs2 callpeak \
+-c lirip1.bam \
+-t lirip2.bam \
+--nomodel \
+-f BAMPE \
+-q 0.05 \
+-g 142573017 \
+-n lsx_ip \
+--outdir ../4.callpeak/
+```
+
+### 筛选peak
+选择在ki中出现，在wt中不存在的peak进行后续处理
+```{bash}
+ls *.xls | while read id
+do
+  prefix=${id%%.*}
+  
+  cat ${id} | \
+  awk -v OFS='\t' '$1 ~ /^[0-9]|^KN|^KZ|^MT/{print "chr"$1,$2-1,$3,$10,$5,$8,$9}' > ${prefix}.bed
+done
+
+bedtools intersect -a z_ki_peaks.bed -b z_wt_peaks.bed -v > only_ki_peak.bed
+bedtools intersect -a z_ki_peaks.bed -b z_wt_peaks.bed -wb > ki_wt_intersect.bed
+
+cat ki_wt_intersect.bed | \
+awk -v FS='\t' -v OFS='\t' '{if($6/$13 >= 5){print $1,$2,$3,$4,$5,$6,$7}}' >> only_ki_peak.bed
+
+```
+
+## peak annotation
+### ChIPseeker peak annotation
+```{r}
+library(ChIPseeker)
+library(TxDb.Drerio.UCSC.danRer11.refGene)
+library(rtracklayer)
+library(org.Dr.eg.db)
+
+txdb=TxDb.Drerio.UCSC.danRer11.refGene
+
+#对只在KI中出现的进行注释
+only_ki_peak <- readPeakFile("/home/huangqllab/shao_rip/5.callpeak/only_ki_peak.bed", as="GRanges")
+
+only_ki_peakAnno <- annotatePeak(only_ki_peak, 
+                                 tssRegion = c(-500, 500), TxDb = txdb, annoDb = "org.Dr.eg.db")
+
+only_ki_annotation <- as.data.frame(only_ki_peakAnno)
+
+#对KI进行注释
+ki_peak <- readPeakFile("/home/huangqllab/shao_rip/5.callpeak/z_ki_peaks.bed", as="GRanges")
+
+ki_peakAnno <- annotatePeak(ki_peak, 
+                            tssRegion = c(-500, 500), TxDb = txdb, annoDb = "org.Dr.eg.db")
+
+ki_annotation <- as.data.frame(ki_peakAnno)
+
+#对WT进行注释
+wt_peak <- readPeakFile("/home/huangqllab/shao_rip/5.callpeak/z_wt_peaks.bed", as="GRanges")
+
+wt_peakAnno <- annotatePeak(wt_peak, 
+                            tssRegion = c(-500, 500), TxDb = txdb, annoDb = "org.Dr.eg.db")
+
+wt_annotation <- as.data.frame(wt_peakAnno)
+```
+
+# GO KEGG富集分析
+```{r}
+setwd("/home/huangqllab/717RNAseq/polyAdiff/")
+
+library(clusterProfiler)
+library(rio)
+library(org.Hs.eg.db)
+
+data <- rio::import("模块富集分析.txt")
+
+#名称转换文件
+idChange="/home/huangqllab/human/geneInfoID.txt"
+idchangeInfo <- rio::import(idChange)
+
+data <- rio::import("模块富集分析.txt")
+
+data <- merge(idchangeInfo,data,by.x="gene_id2",by.y="gene_id")
+
+data_lipo <- data %>% filter(sample=="lipo") %>% dplyr::select(geneID) %>% distinct(geneID,.keep_all = T)
+
+################################################################################
+#GO富集分析
+enrich.go <- enrichGO(gene = data_lipo$geneID,  #待富集的基因列表
+                      OrgDb = 'org.Hs.eg.db',  #指定物种的基因数据库，示例物种是绵羊（sheep）
+                      keyType = 'ENTREZID',  #指定给定的基因名称类型，例如这里以 entrze id 为例
+                      ont = 'ALL',  #GO Ontology，可选 BP、MF、CC，也可以指定 ALL 同时计算 3 者
+                      pAdjustMethod = 'fdr',  #指定 p 值校正方法
+                      pvalueCutoff = 0.05,  #指定 p 值阈值（可指定 1 以输出全部）
+                      qvalueCutoff = 0.2,  #指定 q 值阈值（可指定 1 以输出全部）
+                      readable = FALSE)
+
+write.table(enrich.go, 'enrich.go.txt', sep = '\t', row.names = FALSE, quote = FALSE)
+
+#KEGG富集分析
+enrich.kegg <- enrichKEGG(gene = data_lipo$geneID, #需要分析的基因的EntrezID
+                 organism = "hsa",  #人
+                 keyType = "kegg",
+                 pAdjustMethod = "BH",
+                 pvalueCutoff = 0.05,
+                 qvalueCutoff = 0.2) #设置qvalue界值(FDR校正后的p值）
+write.table(enrich.kegg, 'enrich.kegg.txt', sep = '\t', row.names = FALSE, quote = FALSE)
+
+```
+
